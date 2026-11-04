@@ -54,7 +54,7 @@ def conversion(job_id, video, quality):
     folder.mkdir()
     try:
         url = 'https://www.youtube.com/watch?v=' + video
-        common = ['python3', '-m', 'yt_dlp', '--ignore-config', '--no-playlist',
+        common = ['python3', '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--js-runtimes', 'node',
                   '--socket-timeout', '20', '--retries', '1', '--no-warnings']
         meta = json.loads(run(common + ['--skip-download', '--dump-single-json', '--', url], 65).stdout)
         duration = meta.get('duration')
@@ -81,6 +81,18 @@ def conversion(job_id, video, quality):
     except subprocess.TimeoutExpired:
         with LOCK:
             JOBS[job_id].update(status='failed', error='O vídeo demorou demais para processar. Tente um vídeo menor.', finished=time.time())
+        shutil.rmtree(folder, ignore_errors=True)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr or ''
+        print('yt-dlp failure: ' + detail[-1200:].replace(url, '[video]'), flush=True)
+        if 'confirm' in detail.lower() and 'bot' in detail.lower():
+            error = 'O YouTube está exigindo uma verificação de acesso para este servidor. O download não pôde ser concluído.'
+        elif 'unavailable' in detail.lower() or 'private video' in detail.lower():
+            error = 'Este vídeo está indisponível ou é restrito. Escolha outro vídeo público.'
+        else:
+            error = 'Não foi possível baixar este vídeo do YouTube agora. Tente novamente mais tarde.'
+        with LOCK:
+            JOBS[job_id].update(status='failed', error=error, finished=time.time())
         shutil.rmtree(folder, ignore_errors=True)
     except Exception:
         # Never expose yt-dlp logs, network details, cookies or credentials to visitors.
