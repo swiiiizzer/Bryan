@@ -1,0 +1,4 @@
+.git
+.openai
+__pycache__
+test_server.py
