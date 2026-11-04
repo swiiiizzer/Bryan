@@ -10,7 +10,7 @@ import time
 import uuid
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 ROOT = Path(__file__).parent
 FILES = Path(tempfile.gettempdir()) / 'mp3-exe-jobs'
@@ -103,6 +103,29 @@ def conversion(job_id, video, quality):
         SLOT.release()
 
 
+def convert_upload(key, quality):
+    folder = FILES / key
+    try:
+        source = folder / 'input'
+        meta = json.loads(run(['ffprobe', '-v', 'error', '-protocol_whitelist', 'file,pipe', '-show_format', '-show_streams', '-of', 'json', str(source)], 20).stdout)
+        duration = float(meta.get('format', {}).get('duration', 0))
+        if not 0 < duration <= MAX_DURATION:
+            raise ValueError('Envie um arquivo de até 20 minutos.')
+        if not any(x.get('codec_type') == 'audio' for x in meta.get('streams', [])):
+            raise ValueError('Este vídeo não contém uma faixa de áudio.')
+        run(['ffmpeg', '-nostdin', '-v', 'error', '-protocol_whitelist', 'file,pipe', '-i', str(source), '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-b:a', quality + 'k', '-y', str(folder / 'audio.mp3')], 240)
+        with LOCK:
+            JOBS[key].update(status='ready', finished=time.time())
+    except Exception as exc:
+        error = str(exc) if isinstance(exc, ValueError) else 'Não foi possível converter este arquivo. Envie um vídeo válido com áudio.'
+        with LOCK:
+            JOBS[key].update(status='failed', error=error, finished=time.time())
+        shutil.rmtree(folder, ignore_errors=True)
+    finally:
+        (folder / 'input').unlink(missing_ok=True)
+        SLOT.release()
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT / 'dist'), **kwargs)
@@ -144,8 +167,45 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Max-Age', '600')
         self.end_headers()
 
+    def receive_upload(self):
+        if not self.allowed_origin():
+            return self.json_response({'error': 'Origem não autorizada.'}, 403)
+        try:
+            size = int(self.headers.get('Content-Length', '0'))
+            quality = parse_qs(urlsplit(self.path).query).get('quality', ['192'])[0]
+            if quality not in ('128', '192', '320') or not 0 < size <= 50 * 1024 * 1024:
+                raise ValueError()
+        except ValueError:
+            return self.json_response({'error': 'Envie um arquivo de até 50 MB e uma qualidade válida.'}, 400)
+        if not SLOT.acquire(blocking=False):
+            return self.json_response({'error': 'O conversor está ocupado. Tente novamente em instantes.'}, 429)
+        key = uuid.uuid4().hex
+        folder = FILES / key
+        folder.mkdir()
+        try:
+            self.connection.settimeout(60)
+            remaining = size
+            with (folder / 'input').open('wb') as output:
+                while remaining:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        raise ValueError('Envio interrompido.')
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            self.connection.settimeout(None)
+        except Exception:
+            SLOT.release()
+            shutil.rmtree(folder, ignore_errors=True)
+            return self.json_response({'error': 'O envio foi interrompido. Tente novamente.'}, 400)
+        with LOCK:
+            JOBS[key] = {'id': key, 'status': 'converting', 'title': 'Audio convertido', 'quality': quality, 'created': time.time()}
+        threading.Thread(target=convert_upload, args=(key, quality), daemon=True).start()
+        self.json_response({'id': key, 'status': 'converting'}, 202)
+
     def do_POST(self):
         cleanup()
+        if urlsplit(self.path).path == '/api/uploads':
+            return self.receive_upload()
         if urlsplit(self.path).path != '/api/jobs':
             return self.json_response({'error': 'Endereço não encontrado.'}, 404)
         if not self.allowed_origin():
